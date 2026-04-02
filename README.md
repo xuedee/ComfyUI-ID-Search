@@ -5,7 +5,7 @@ A lightweight node search and logical navigation tool for ComfyUI. Designed to s
 
 ---
 
-# ComfyUI IDSearch Pro (Ultimate Edition)
+# ComfyUI ID Search Lite (Ultimate Edition)
 
 A powerful node navigation and semantic search system for ComfyUI.
 
