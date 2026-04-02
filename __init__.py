@@ -1,5 +1,7 @@
-from pathlib import Path
-
-WEB_DIRECTORY = str(Path(__file__).parent / "web")
-
+# ComfyUI ID Search Lite - Entry Point
 NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
+
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
