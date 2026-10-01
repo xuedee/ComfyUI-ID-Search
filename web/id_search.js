@@ -46,105 +46,464 @@ app.registerExtension({
         document.body.append(container, dropdown, leftBtn, rightBtn);
 
         // =========================
-        // 3. Helper Functions
+        // 3. Graph / Node Helpers
         // =========================
+
+        // IMPORTANT:
+        // app.graph is not sufficient for Subgraphs. The active canvas graph is
+        // app.canvas.graph, and every Subgraph owns its own _nodes / links.
+        const getActiveGraph = () => app.canvas?.graph || app.graph;
+
+        // Recursively walk Root -> Subgraph -> Nested Subgraph -> ...
+        // A Subgraph can be nested many levels deep, so do not stop at one level.
+        const walkGraphs = (graph, callback, path = [], visited = new Set()) => {
+            if (!graph || visited.has(graph)) return;
+            visited.add(graph);
+
+            callback(graph, path);
+
+            const nodes = graph._nodes || graph.nodes || [];
+            for (const node of nodes) {
+                if (node?.isSubgraphNode?.() && node.subgraph) {
+                    walkGraphs(
+                        node.subgraph,
+                        callback,
+                        [...path, node],
+                        visited
+                    );
+                }
+            }
+        };
+
+        // Find the chain of SubgraphNodes from Root -> target graph.
+        // Example:
+        // Root -> Subgraph B -> Subgraph D
+        // returns [SubgraphNode(B), SubgraphNode(D)]
+        const findGraphPath = (rootGraph, targetGraph) => {
+            if (!rootGraph || !targetGraph) return null;
+            if (rootGraph === targetGraph) return [];
+
+            let found = null;
+
+            walkGraphs(rootGraph, (graph, path) => {
+                if (!found && graph === targetGraph) {
+                    found = path;
+                }
+            });
+
+            return found;
+        };
+
+        // Enter a target graph through ComfyUI's normal subgraph navigation.
+        // We open each level in order so the canvas navigation stack remains valid.
+        const openGraphPath = (targetGraph) => {
+            const canvas = app.canvas;
+
+            if (!canvas || !targetGraph) {
+                return false;
+            }
+
+            const rootGraph = app.graph || canvas.graph;
+            const path = findGraphPath(rootGraph, targetGraph);
+
+            if (!path) {
+                console.warn(
+                    "[IDSearch] Cannot find graph path to target graph."
+                );
+                return false;
+            }
+
+            // Already at the target graph.
+            if (canvas.graph === targetGraph) {
+                return true;
+            }
+
+            // ---------------------------------------------------------
+            // Always return to Root first.
+            //
+            // Do NOT rely on canvas.subgraph being truthy here.
+            // The reliable condition is simply whether the active
+            // graph is different from the root graph.
+            // ---------------------------------------------------------
+            let guard = 0;
+
+            while (
+                canvas.graph &&
+                canvas.graph !== rootGraph &&
+                guard++ < 1000
+            ) {
+                if (typeof canvas.closeSubgraph !== "function") {
+                    break;
+                }
+
+                const beforeGraph = canvas.graph;
+
+                canvas.closeSubgraph();
+
+                // Prevent an infinite loop if the frontend refuses
+                // to change the active graph.
+                if (canvas.graph === beforeGraph) {
+                    console.warn(
+                        "[IDSearch] closeSubgraph() did not change the active graph."
+                    );
+                    break;
+                }
+            }
+
+            // Fallback for frontends where closeSubgraph() cannot
+            // restore the root graph completely.
+            if (
+                canvas.graph !== rootGraph &&
+                typeof canvas.setGraph === "function"
+            ) {
+                canvas.setGraph(rootGraph);
+            }
+            
+            // ---------------------------------------------------------
+            // Enter the target graph level by level.
+            // Example:
+            // Root -> Subgraph A -> Subgraph B
+            // ---------------------------------------------------------
+            for (const subgraphNode of path) {
+                const subgraph = subgraphNode?.subgraph;
+
+                if (!subgraph) {
+                    console.warn(
+                        "[IDSearch] SubgraphNode has no subgraph."
+                    );
+                    return false;
+                }
+
+                if (canvas.graph === subgraph) {
+                    continue;
+                }
+
+                if (typeof canvas.openSubgraph === "function") {
+                    canvas.openSubgraph(subgraph);
+                } else if (typeof canvas.setGraph === "function") {
+                    canvas.setGraph(subgraph);
+                } else {
+                    console.warn(
+                        "[IDSearch] Canvas has no Subgraph navigation API."
+                    );
+                    return false;
+                }
+            }
+
+            return canvas.graph === targetGraph;
+        };
+
+        const getGraphPathLabels = (graphPath) => {
+            if (!graphPath?.length) return "Root";
+            return ["Root", ...graphPath.map(node =>
+                node?.title || node?.name || node?.type || `Subgraph ${node?.id ?? "?"}`
+            )].join(" / ");
+        };
+
+        const getNodeGraphPath = (node) => {
+            if (!node) return [];
+            const rootGraph = app.graph;
+            return findGraphPath(rootGraph, node.graph) || [];
+        };
+
+        const getNodeLocationKey = (node) => {
+            if (!node) return "";
+            const graph = node.graph;
+            const graphId = graph?.id ?? "root";
+            return `${String(graphId)}:${String(node.id)}`;
+        };
+
         const clearVisuals = () => {
             highlightNodes.forEach(n => {
                 if (n._origColor !== undefined) {
-                    n.color = n._origColor; n.boxcolor = n._origBoxColor; n.bgcolor = n._origBgColor;
-                    delete n._origColor; delete n._origBoxColor; delete n._origBgColor;
+                    n.color = n._origColor;
+                    n.boxcolor = n._origBoxColor;
+                    n.bgcolor = n._origBgColor;
+                    delete n._origColor;
+                    delete n._origBoxColor;
+                    delete n._origBgColor;
                 }
             });
             highlightNodes.clear();
             app.canvas.draw(true, true);
         };
 
+        // jumpTo now knows BOTH the node and its owning graph.
         const jumpTo = (node, isManual = false, matchedWidget = null) => {
             if (!node) return;
+
             clearVisuals();
+
+            // Enter the correct nested Subgraph before trying to center/select.
+            if (!openGraphPath(node.graph)) return;
+
             currentNode = node;
             input.value = String(node.id);
 
             if (isManual) {
                 navMode = "chain";
-                const entry = { id: String(node.id), title: node.title || node.type };
-                searchHistory = [entry, ...searchHistory.filter(h => h.id !== entry.id)].slice(0, 20);
-                
+
+                const graphPath = getNodeGraphPath(node);
+                const locationKey = getNodeLocationKey(node);
+
+                const entry = {
+                    id: String(node.id),
+                    title: node.title || node.type,
+                    graph: node.graph,
+                    graphPath,
+                    graphPathLabel: getGraphPathLabels(graphPath),
+                    locationKey
+                };
+
+                searchHistory = [
+                    entry,
+                    ...searchHistory.filter(h => h.locationKey !== locationKey)
+                ].slice(0, 20);
+
                 if (matchedWidget) {
-                    console.log(`%c[IDSearch] Matched Widget in Node ${node.id}: %c${matchedWidget.name}%c, Value: %c${matchedWidget.value}`, "color: #ccc;", "color: #FF9900; font-weight: bold;", "color: #ccc;", "color: #00FFCC;");
+                    console.log(
+                        `%c[IDSearch] Matched Widget in Node ${node.id}: ` +
+                        `%c${matchedWidget.name}%c, Value: %c${matchedWidget.value}`,
+                        "color: #ccc;",
+                        "color: #FF9900; font-weight: bold;",
+                        "color: #ccc;",
+                        "color: #00FFCC;"
+                    );
                 }
             }
 
             app.canvas.centerOnNode(node);
             app.canvas.selectNode(node, false);
-            
-            const old = node.color; let c = 0;
-            const f = () => { if (c < 3) { node.color = "#FF9900"; app.canvas.draw(true, true); setTimeout(() => { node.color = old; app.canvas.draw(true, true); setTimeout(f, 120); }, 120); c++; } };
+
+            const old = node.color;
+            let c = 0;
+            const f = () => {
+                if (c < 3) {
+                    node.color = "#FF9900";
+                    app.canvas.draw(true, true);
+                    setTimeout(() => {
+                        node.color = old;
+                        app.canvas.draw(true, true);
+                        setTimeout(f, 120);
+                        c++;
+                    }, 120);
+                }
+            };
             f();
         };
 
+        // Navigation must use the graph that owns currentNode.
+        // Never use app.graph.links for a node inside a Subgraph.
         const navigate = (dir) => {
-            if (!currentNode) return;
-            let targets = [];
+            if (!currentNode) {
+                return;
+            }
+
+            const graph =
+                currentNode.graph ||
+                getActiveGraph();
+
+            if (!graph) {
+                return;
+            }
+
             const isDown = dir === "down";
-            const side = isDown ? currentNode.outputs : currentNode.inputs;
-            side?.forEach(slot => {
-                const links = isDown ? slot.links : [slot.link];
-                links?.forEach(lid => {
-                    const l = app.graph.links[lid];
-                    if (l) {
-                        const n = app.graph.getNodeById(isDown ? l.target_id : l.origin_id);
-                        if(n) targets.push(n);
+            const targets = [];
+            const links = graph.links;
+
+            if (!links) {
+                return;
+            }
+
+            // ---------------------------------------------------------
+            // Follow the actual graph links, rather than relying only
+            // on the current node's output/input slot arrays.
+            //
+            // This guarantees: 161 -> 151 -> 145
+            // instead of accidentally jumping 161 -> 145.
+            // ---------------------------------------------------------
+            const addLinkTarget = (link) => {
+                if (!link) {
+                    return;
+                }
+
+                const targetId = isDown
+                    ? link.target_id
+                    : link.origin_id;
+
+                if (
+                    targetId === undefined ||
+                    targetId === null
+                ) {
+                    return;
+                }
+
+                const target =
+                    graph.getNodeById(targetId);
+
+                if (target) {
+                    targets.push(target);
+                }
+            };
+
+            // Current ComfyUI uses a Map for graph.links.
+            // Keep object support as a compatibility fallback.
+            if (typeof links.forEach === "function") {
+                links.forEach((link) => {
+                    if (!link) {
+                        return;
+                    }
+
+                    const matches = isDown
+                        ? link.origin_id === currentNode.id
+                        : link.target_id === currentNode.id;
+
+                    if (matches) {
+                        addLinkTarget(link);
                     }
                 });
-            });
-            const fresh = [...new Set(targets.filter(Boolean))];
-            if (!fresh.length) return;
+            } else {
+                Object.values(links).forEach((link) => {
+                    if (!link) {
+                        return;
+                    }
+
+                    const matches = isDown
+                        ? link.origin_id === currentNode.id
+                        : link.target_id === currentNode.id;
+
+                    if (matches) {
+                        addLinkTarget(link);
+                    }
+                });
+            }
+
+            const fresh = [
+                ...new Set(
+                    targets.filter(Boolean)
+                )
+            ];
+
+            if (!fresh.length) {
+                return;
+            }
+
+            // Only move one actual link at a time.
             jumpTo(fresh[0], false);
         };
-
         // =========================
         // 4. Enhanced Search Logic
         // =========================
+
         const renderDropdown = (items) => {
             dropdown.innerHTML = "";
+
             items.forEach((data, index) => {
                 const item = document.createElement("div");
-                item.textContent = `[${data.id}] ${data.title || data.type}`;
-                Object.assign(item.style, { padding: "8px", cursor: "pointer", borderBottom: "1px solid #333", background: index === selectedIndex ? "#FF990044" : "transparent" });
-                item._matchedWidget = data._matchedWidget; 
 
-                item.onmousedown = (e) => { 
-                    e.preventDefault(); 
-                    const n = app.graph.getNodeById(data.id);
-                    if(n) jumpTo(n, true, item._matchedWidget);
-                    dropdown.style.display = "none"; 
+                const location = data.graphPathLabel
+                    ? ` ↳ ${data.graphPathLabel}`
+                    : "";
+
+                item.textContent =
+                    `[${data.id}] ${data.title || data.type}${location}`;
+
+                Object.assign(item.style, {
+                    padding: "8px",
+                    cursor: "pointer",
+                    borderBottom: "1px solid #333",
+                    background: index === selectedIndex
+                        ? "#FF990044"
+                        : "transparent"
+                });
+
+                item._matchedWidget = data._matchedWidget;
+
+                item.onmousedown = (e) => {
+                    e.preventDefault();
+
+                    jumpTo(
+                        data.node,
+                        true,
+                        item._matchedWidget
+                    );
+
+                    dropdown.style.display = "none";
                 };
+
                 dropdown.appendChild(item);
             });
+
             dropdown.style.display = items.length ? "block" : "none";
         };
 
         const updateSearch = () => {
             isShowingHistory = false;
+
             const val = input.value.trim().toLowerCase();
-            if (!val) { dropdown.style.display = "none"; return; }
-            const nodes = app.graph?._nodes || [];
 
-            results = nodes.map(n => {
-                let matchedWidget = null;
-                if (n.widgets) {
-                    matchedWidget = n.widgets.find(w => String(w.value).toLowerCase().includes(val));
-                }
-                const matchType = (n.title || n.type || "").toLowerCase().includes(val);
-                const matchId = String(n.id).includes(val);
-                if (matchId || matchType || matchedWidget) {
-                    return { ...n, _matchedWidget: matchedWidget };
-                }
-                return null;
-            }).filter(Boolean);
+            if (!val) {
+                dropdown.style.display = "none";
+                return;
+            }
 
-            results.sort((a,b) => String(a.id) === val ? -1 : String(a.id).length - String(b.id).length).slice(0, 20);
+            results = [];
+
+            // Search ROOT + every nested Subgraph recursively.
+            walkGraphs(app.graph, (graph, graphPath) => {
+                const nodes = graph?._nodes || graph?.nodes || [];
+
+                nodes.forEach(n => {
+                    let matchedWidget = null;
+
+                    if (n.widgets) {
+                        matchedWidget = n.widgets.find(w =>
+                            String(w.value).toLowerCase().includes(val)
+                        );
+                    }
+
+                    const matchType =
+                        (n.title || n.type || "")
+                            .toLowerCase()
+                            .includes(val);
+
+                    const matchId =
+                        String(n.id)
+                            .toLowerCase()
+                            .includes(val);
+
+                    if (matchId || matchType || matchedWidget) {
+                        results.push({
+                            node: n,
+                            id: String(n.id),
+                            title: n.title,
+                            type: n.type,
+                            graph,
+                            graphPath,
+                            graphPathLabel: getGraphPathLabels(graphPath),
+                            _matchedWidget: matchedWidget,
+                            locationKey: getNodeLocationKey(n)
+                        });
+                    }
+                });
+            });
+
+            results.sort((a, b) => {
+                const aExact = String(a.id).toLowerCase() === val;
+                const bExact = String(b.id).toLowerCase() === val;
+
+                if (aExact !== bExact) return aExact ? -1 : 1;
+
+                const lengthDiff =
+                    String(a.id).length - String(b.id).length;
+
+                if (lengthDiff !== 0) return lengthDiff;
+
+                return a.graphPath.length - b.graphPath.length;
+            });
+
+            results = results.slice(0, 20);
+
             selectedIndex = -1;
             renderDropdown(results);
         };
@@ -172,7 +531,30 @@ app.registerExtension({
                     e.preventDefault(); e.stopImmediatePropagation();
                     requestAnimationFrame(() => {
                         const id = prompt("Enter Node ID to relocate start node:", currentNode ? currentNode.id : "");
-                        if (id) { const n = app.graph.getNodeById(id.trim()); if (n) jumpTo(n, true); }
+                        if (id) {
+                            const matches = [];
+                            walkGraphs(app.graph, (graph) => {
+                                const n = graph.getNodeById(id.trim());
+                                if (n) matches.push(n);
+                            });
+
+                            if (matches.length === 1) {
+                                jumpTo(matches[0], true);
+                            } else if (matches.length > 1) {
+                                // If IDs collide, prefer the node in the currently
+                                // active graph. Otherwise ask the user to use Search.
+                                const active = getActiveGraph();
+                                const local = matches.find(n => n.graph === active);
+                                if (local) {
+                                    jumpTo(local, true);
+                                } else {
+                                    console.warn(
+                                        `[IDSearch] Node ID ${id.trim()} exists in multiple graphs. ` +
+                                        "Use the search dropdown to choose the exact location."
+                                    );
+                                }
+                            }
+                        }
                     });
                 }
                 if (key === 'arrowleft') { e.preventDefault(); navigate("up"); }
@@ -190,19 +572,36 @@ app.registerExtension({
                         e.preventDefault();
                         const targetData = selectedIndex >= 0 ? list[selectedIndex] : list[0];
                         if (targetData) {
-                            const n = app.graph.getNodeById(targetData.id);
-                            if(n) jumpTo(n, true, targetData._matchedWidget);
+                            if (targetData.node) {
+                                jumpTo(
+                                    targetData.node,
+                                    true,
+                                    targetData._matchedWidget
+                                );
+                            }
                         }
                         dropdown.style.display = "none"; input.blur();
                     }
                 }
             } else if (e.key === "Enter" && document.activeElement === input) {
-                const n = app.graph.getNodeById(input.value.trim()); if (n) jumpTo(n, true);
+                const id = input.value.trim();
+                const matches = [];
+                walkGraphs(app.graph, (graph) => {
+                    const n = graph.getNodeById(id);
+                    if (n) matches.push(n);
+                });
+
+                if (matches.length === 1) {
+                    jumpTo(matches[0], true);
+                } else if (matches.length > 1) {
+                    const active = getActiveGraph();
+                    const local = matches.find(n => n.graph === active);
+                    if (local) jumpTo(local, true);
+                }
             }
         }, true);
 
         window.addEventListener("keyup", (e) => activeKeys.delete(e.key.toLowerCase()), true);
-
         // =========================
         // 6. UI Helpers & Cleanup
         // =========================
@@ -216,7 +615,15 @@ app.registerExtension({
 
         const orgSerialize = app.graph.serialize;
         app.graph.serialize = function() {
-            app.graph._nodes?.forEach(n => { if (n._origColor !== undefined) { n.color = n._origColor; n.boxcolor = n._origBoxColor; n.bgcolor = n._origBgColor; } });
+            walkGraphs(this, (graph) => {
+                graph._nodes?.forEach(n => {
+                    if (n._origColor !== undefined) {
+                        n.color = n._origColor;
+                        n.boxcolor = n._origBoxColor;
+                        n.bgcolor = n._origBgColor;
+                    }
+                });
+            });
             return orgSerialize.apply(this, arguments);
         };
     }
